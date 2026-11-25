@@ -56,7 +56,7 @@ resource "local_file" "ansible_inventory" {
   ])
 
   depends_on = [
-    azurerm_virtual_machine_extension.winrm
+    azurerm_virtual_machine_run_command.bootstrap
   ]
 }
 

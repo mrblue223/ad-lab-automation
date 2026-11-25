@@ -68,7 +68,8 @@ admitting only `allowed_source_ip` (/32). See [security-model.md](security-model
      from `.secrets/tailscale-authkey` (written by `make setup`), or `TS_AUTHKEY`.
    - *public:* your current IP is used for this run if it has changed.
 5. **Terraform.** Creates the RG, VNet, NSG, route table, 3 NICs with static private IPs, and
-   3 VMs (Trusted Launch). A CustomScript extension runs
+   3 VMs (Trusted Launch). A managed Run Command (`lab-bootstrap`, a plain `.ps1`; its exit
+   code fails the apply if the script fails) runs
    [`terraform/scripts/bootstrap.ps1.tftpl`](../terraform/scripts/bootstrap.ps1.tftpl), which
    sets up WinRM over HTTPS on 5986. On HYDRA-DC it also installs Tailscale, joins your
    tailnet, advertises `10.0.2.0/24`, and turns on IP forwarding. Terraform writes the Ansible

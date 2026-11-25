@@ -1,7 +1,12 @@
-# VM bootstrap (CustomScript extension). Idempotent: safe to re-run on any VM.
+# VM bootstrap — delivered by Azure *managed Run Command* as a plain .ps1 file
+# (never as an encoded/compressed in-memory blob: Defender's behaviour monitor
+# kills that pattern as Behavior:Win32/PShellCobStager). Idempotent.
 #  * every VM : WinRM over HTTPS on 5986 for Ansible (self-signed cert, NTLM, no Basic)
 #  * HYDRA-DC : (tailscale mode) join the tailnet + route the lab subnet to it
 # WinRM is configured FIRST, so a Tailscale problem never costs you Ansible access.
+# The Tailscale key arrives as a protected (encrypted) parameter — it is never
+# part of the script text, which Azure shows in the run command's properties.
+param([string]$TsAuthKey = '')
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # PS 5.1's progress bar makes downloads crawl
 Start-Transcript -Path C:\WindowsAzure\lab-bootstrap.log -Append | Out-Null
@@ -107,7 +112,7 @@ try {
   $tsArgs = @('--hostname=${hostname}', '--advertise-routes=${routes}', '--advertise-tags=${tags}',
               '--accept-dns=false', '--accept-routes=false', '--unattended', '--timeout=120s')
   if ($state -ne 'Running') {
-    $key = '${auth_key}'
+    $key = $TsAuthKey
     if (-not $key) { Fail 'No Tailscale auth key was supplied. Run `make setup` (step 5) to store one, then re-run ./deploy-azure.sh.' }
     # Output is captured (never echoed raw) and the key is redacted from any error.
     $r = Invoke-Native $ts (@('up', "--auth-key=$key") + $tsArgs)

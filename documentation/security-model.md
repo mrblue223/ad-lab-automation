@@ -77,7 +77,7 @@ The repository is safe to publish. **It contains no secrets and no personal data
 | Secret | Where | Protection |
 |---|---|---|
 | VM admin password | `terraform/terraform.tfvars`, `ansible/inventory/azure_generated.yml`, Terraform state | All gitignored. tfvars and the inventory are mode 0600. The tfvars variable is `sensitive`. |
-| Tailscale auth key | `.secrets/tailscale-authkey` (written by `make setup`), passed to Terraform as an env var, extension `protected_settings`, Terraform state | All gitignored. Never written to tfvars. Encrypted in the extension and not shown in the instance view. Short expiry; revoke and delete it after the build if you like. |
+| Tailscale auth key | `.secrets/tailscale-authkey` (written by `make setup`), passed to Terraform as an env var, the Run Command's protected parameter `TsAuthKey`, Terraform state | All gitignored. Never written to tfvars or into the script text. Encrypted in transit to the VM and not shown in the Run Command's properties or instance view. Short expiry; revoke and delete it after the build if you like. |
 | Lab domain passwords | `ansible/group_vars/all.yml` (committed) | **Intentionally public.** They're the training scenario. Never reuse them. |
 
 Check that nothing sensitive is tracked:

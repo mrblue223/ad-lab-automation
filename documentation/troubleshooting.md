@@ -49,53 +49,82 @@ Terraform returns `QuotaExceeded` / `SkuNotAvailable`.
 
 ## WinRM never comes up
 
-`deploy-azure.sh` waits up to `WINRM_TIMEOUT` (20 min) for TCP 5986, then runs `win_ping` up to
-5 times. On failure it prints the status of the `enable-winrm` extension for each VM.
+Each VM is bootstrapped by an Azure **managed Run Command** named `lab-bootstrap`. Azure writes
+[`terraform/scripts/bootstrap.ps1.tftpl`](../terraform/scripts/bootstrap.ps1.tftpl), rendered for
+that VM, to a plain `.ps1` file and runs it. Terraform reads the **real exit code**: if the
+script fails, `terraform apply` fails with the script's error. A broken bootstrap can no longer
+show up as a "succeeded" extension.
+
+`deploy-azure.sh` then waits up to `WINRM_TIMEOUT` (20 min) for TCP 5986 and runs `win_ping` up
+to 5 times. On failure it prints each VM's bootstrap state, exit code and output.
 
 1. **No path to the VM.** In tailscale mode, run `make azure-tailnet`: the DC must be online,
    and the route approved and installed. See [tailscale.md → Troubleshooting](tailscale.md#7-troubleshooting).
    In public mode, check your IP hasn't changed (`make azure-myip`).
-2. **The extension failed.** Look at its status (printed by the script), then at the log on the VM:
+2. **The bootstrap failed.** Check its status and the log on the VM:
    ```bash
-   az vm run-command invoke -g rg-adlab-marvel -n HYDRA-DC --command-id RunPowerShellScript \
-     --scripts "winrm enumerate winrm/config/listener; Get-Content C:\WindowsAzure\lab-bootstrap.log -Tail 30"
+   az vm run-command show -g rg-adlab-marvel --vm-name THEPUNISHER --name lab-bootstrap --instance-view \
+     --query "instanceView.{state:executionState,exit:exitCode,error:error}"
+   az vm run-command invoke -g rg-adlab-marvel -n THEPUNISHER --command-id RunPowerShellScript \
+     --scripts "Get-Content C:\WindowsAzure\lab-bootstrap.log -Tail 30"
    ```
-3. **Re-run the bootstrap.** For the DC in tailscale mode this needs a valid key:
-   `TF_VAR_tailscale_auth_key=tskey-... terraform -chdir=terraform apply -replace='azurerm_virtual_machine_extension.winrm["HYDRA-DC"]'`
+3. **Re-run it:** run `./deploy-azure.sh` again. It replaces any bootstrap whose last run exited
+   non-zero, and supplies the DC's Tailscale key from `make setup`. Only that step re-runs.
 4. **`win_ping` fails with an auth or 401 error** while the port is open: check that
    `ansible_password` in `ansible/inventory/azure_generated.yml` matches `admin_password`.
    The file is regenerated on every apply.
 5. **`No module named winrm`:** install pywinrm for Ansible's Python (see the setup guide).
 
-Background: the bootstrap is [`terraform/scripts/bootstrap.ps1.tftpl`](../terraform/scripts/bootstrap.ps1.tftpl),
-rendered for each VM and passed inline (base64) through `protected_settings`. Only the DC
-downloads anything: the Tailscale MSI, from pkgs.tailscale.com. It
-replaced the deprecated `ConfigureRemotingForAnsible.ps1`, which was pulled from GitHub's
-`devel` branch and failed on client OSes whose network profile is "Public".
+Only the DC downloads anything during bootstrap: the Tailscale MSI, from pkgs.tailscale.com.
+The bootstrap replaced the deprecated `ConfigureRemotingForAnsible.ps1`.
+
+## Bootstrap "succeeded" but did nothing: Microsoft Defender
+
+**What happened on the first real deploy.** The bootstrap used to be passed to a CustomScript
+extension as one command line: base64 → `GzipStream` → `[ScriptBlock]::Create`, which kept it
+under cmd.exe's length limit. That is precisely the shape of a malware PowerShell stager.
+Defender's behaviour monitor (Tamper Protection on, as on every fresh Azure image) killed the
+process before the script's first line, as `Behavior:Win32/PShellCobStager.A`. The extension
+still reported success.
+
+How it was confirmed, if you ever need to check again:
+
+```bash
+az vm run-command invoke -g rg-adlab-marvel -n <VM> --command-id RunPowerShellScript \
+  --scripts "Get-MpThreatDetection | Select InitialDetectionTime,ThreatID,ProcessName"
+```
+
+**The fix:** the bootstrap is now an ordinary script file (managed Run Command), with no encoded
+or compressed loader, and the Tailscale key arrives as an encrypted *protected parameter*
+instead of being embedded in the script. Don't reintroduce an encoded wrapper to save space:
+Run Command has no 8191-character limit.
+
+Note: Defender also explains why the lab's "disable Defender" weakening is best-effort on Azure
+images. Tamper Protection can veto `Set-MpPreference`, and the DC's GPO is the backstop.
 
 ## Bootstrap failed: "network connection types … set to Public"
 
 Fresh Azure VMs, Windows 11 in particular, start with the NIC in the **Public** network
 category, and WinRM refuses to create its firewall exception while any profile is Public. The
-bootstrap now waits for the network to finish "Identifying", moves every non-domain profile to
-**Private**, and only then enables WinRM. It also falls back to `Set-WSManQuickConfig
+bootstrap waits for the network to finish "Identifying", moves every non-domain profile to
+**Private**, and only then enables WinRM. It falls back to `Set-WSManQuickConfig
 -SkipNetworkProfileCheck` if needed. Its own 5986 and tailnet firewall rules apply to *every*
 profile, so later changes (domain join, the Tailscale adapter) can't close them.
 
 ## Re-running after a failed bootstrap
 
-A failed CustomScript run leaves the `enable-winrm` extension in Azure in the **Failed** state
-but *not* in Terraform state. azurerm then refuses to create it ("already exists – needs to be
-imported"), and extensions can't be installed on deallocated VMs at all. `./deploy-azure.sh`
-repairs both before applying:
+`./deploy-azure.sh` repairs a previous failed run before applying:
 
-1. It starts any stopped or deallocated lab VMs.
-2. For each VM it compares Terraform state with Azure. It deletes orphaned or Failed extensions
-   (or forces `-replace`), so only the bootstraps re-run. **VMs are never rebuilt.**
+1. It starts any stopped or deallocated lab VMs, because Run Commands need a running VM.
+2. For each VM it compares Terraform state with Azure:
+   - a `lab-bootstrap` that Azure has but state doesn't (an interrupted apply) is deleted, so
+     azurerm can create it;
+   - one whose last run exited non-zero is `-replace`d;
+   - leftover CustomScript `enable-winrm` extensions from older versions are removed.
 3. If HYDRA-DC's bootstrap is re-running, it requires the Tailscale key stored by `make setup`.
 
-The bootstrap log on each VM is `C:\WindowsAzure\lab-bootstrap.log`. The extension status shows a
-single `LAB-BOOTSTRAP ERROR: …` line that names the fix.
+**VMs are never rebuilt.** The bootstrap log on each VM is `C:\WindowsAzure\lab-bootstrap.log`,
+and a failure ends with a single `LAB-BOOTSTRAP ERROR: …` line that names the fix.
 
 ## Domain join fails / bad credentials
 

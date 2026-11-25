@@ -122,13 +122,16 @@ fi
 python3 scripts/azure-preflight.py "${PREFLIGHT_ARGS[@]}" || die "Pre-flight failed (see above). Adjust $TFVARS and re-run."
 
 # ---- 3a. repair a previous failed run (existing VMs only) --------------------
-# A failed CustomScript run leaves the extension in Azure (state "Failed") but
-# NOT in Terraform state, and azurerm refuses to create a resource that already
-# exists. Extensions also can't be installed on deallocated VMs. Fix both, so a
-# re-run retries only the bootstraps — the VMs themselves are never rebuilt.
+# Bootstraps run as managed Run Command "lab-bootstrap" (a plain .ps1 file).
+# Before applying: start deallocated VMs (commands need a running VM), remove
+# leftovers Azure has but Terraform doesn't (azurerm won't create over them),
+# and force a re-run of any bootstrap whose last run exited non-zero.
+# Legacy CustomScript "enable-winrm" extensions are cleaned up too.
+# The VMs themselves are never rebuilt.
+BOOT_ADDR() { printf 'azurerm_virtual_machine_run_command.bootstrap["%s"]' "$1"; }
 REBOOTSTRAP=()
 if tf state list 2>/dev/null | command grep -q '^azurerm_windows_virtual_machine\.'; then
-  say "Existing lab found — checking VM power state and bootstrap extensions"
+  say "Existing lab found — checking VM power state and bootstraps"
   IFS=',' read -r -a WS_LIST <<< "$WS_NAMES"
   ALL_VMS=("HYDRA-DC" "${WS_LIST[@]}")
 
@@ -143,30 +146,44 @@ if tf state list 2>/dev/null | command grep -q '^azurerm_windows_virtual_machine
   fi
 
   STATE_JSON="$(tf show -json)"
-  for vm in "${ALL_VMS[@]}"; do
-    addr="azurerm_virtual_machine_extension.winrm[\"$vm\"]"
-    in_state="$(python3 -I -c '
+  state_of() {   # absent | tainted | exit:<code>
+    python3 -I -c '
 import json, sys
 d = json.loads(sys.stdin.read() or "{}")
 rs = d.get("values", {}).get("root_module", {}).get("resources", [])
 r = next((r for r in rs if r["address"] == sys.argv[1]), None)
-print("absent" if r is None else ("tainted" if r.get("tainted") else "ok"))' "$addr" <<< "$STATE_JSON")"
-    az_state="$(az vm extension show -g "$RG" --vm-name "$vm" -n enable-winrm --query provisioningState -o tsv 2>/dev/null || true)"
-    az_state="${az_state:-absent}"
-    case "$in_state/$az_state" in
-      absent/absent)  REBOOTSTRAP+=("$vm") ;;                       # never created: plain create
-      absent/*)
-        warn "$vm: enable-winrm is in Azure ($az_state) but not in Terraform state (failed run) — deleting it so it can be recreated."
-        az vm extension delete -g "$RG" --vm-name "$vm" -n enable-winrm -o none
+if r is None: print("absent")
+elif r.get("tainted"): print("tainted")
+else:
+    iv = (r.get("values", {}).get("instance_view") or [{}])[0]
+    print("exit:%s" % iv.get("exit_code"))' "$1" <<< "$STATE_JSON"
+  }
+  for vm in "${ALL_VMS[@]}"; do
+    # legacy CustomScript extension: only an orphan (not in state) needs deleting
+    legacy="azurerm_virtual_machine_extension.winrm[\"$vm\"]"
+    if [ "$(state_of "$legacy")" = absent ] && az vm extension show -g "$RG" --vm-name "$vm" -n enable-winrm -o none 2>/dev/null; then
+      echo "  $vm: removing legacy enable-winrm CustomScript extension"
+      az vm extension delete -g "$RG" --vm-name "$vm" -n enable-winrm -o none || warn "could not delete enable-winrm on $vm"
+    fi
+
+    addr="$(BOOT_ADDR "$vm")"
+    st="$(state_of "$addr")"
+    in_azure=0
+    az vm run-command show -g "$RG" --vm-name "$vm" --name lab-bootstrap -o none 2>/dev/null && in_azure=1
+    case "$st" in
+      absent)
+        if [ "$in_azure" -eq 1 ]; then
+          warn "$vm: lab-bootstrap exists in Azure but not in Terraform state (interrupted run) — deleting it."
+          az vm run-command delete -g "$RG" --vm-name "$vm" --name lab-bootstrap --yes -o none
+        fi
         REBOOTSTRAP+=("$vm") ;;
-      tainted/*)      REBOOTSTRAP+=("$vm") ;;                       # Terraform replaces tainted resources itself
-      ok/Failed)
-        warn "$vm: enable-winrm is in state but Failed in Azure — forcing a re-run."
+      tainted) REBOOTSTRAP+=("$vm") ;;                        # Terraform replaces tainted resources itself
+      exit:0)  ;;                                             # last run succeeded: leave alone
+      *)
+        warn "$vm: last bootstrap run ${st/exit:/exited } — forcing a re-run."
         APPLY_EXTRA+=("-replace=$addr"); REBOOTSTRAP+=("$vm") ;;
-      ok/absent)      REBOOTSTRAP+=("$vm") ;;                       # removed out-of-band; Terraform recreates
-      *)              ;;                                            # ok/Succeeded: leave alone
     esac
-    printf '  %-12s state=%-8s azure=%s\n' "$vm" "$in_state" "$az_state"
+    printf '  %-12s bootstrap=%s\n' "$vm" "$st"
   done
   unset STATE_JSON
   if [ "${#REBOOTSTRAP[@]}" -gt 0 ]; then echo "  Bootstrap will (re)run on: ${REBOOTSTRAP[*]}  (VMs are not rebuilt)"; fi
@@ -196,13 +213,13 @@ else
   # build, or when switching an existing lab from public -> tailscale (the
   # bootstrap is one-shot, so it is re-run explicitly).
   NEED_KEY=0
-  if ! tf state list 2>/dev/null | command grep -qF 'azurerm_virtual_machine_extension.winrm["HYDRA-DC"]'; then
+  if ! tf state list 2>/dev/null | command grep -qF "$(BOOT_ADDR HYDRA-DC)"; then
     NEED_KEY=1
   elif printf '%s\n' "${REBOOTSTRAP[@]}" | command grep -qx 'HYDRA-DC'; then
     NEED_KEY=1                                  # DC bootstrap is being retried
   elif [ "$(tf output -raw access_mode 2>/dev/null || true)" = "public" ]; then
     warn "Switching this lab from public to tailscale access: re-running HYDRA-DC's bootstrap."
-    APPLY_EXTRA+=('-replace=azurerm_virtual_machine_extension.winrm["HYDRA-DC"]')
+    APPLY_EXTRA+=("-replace=$(BOOT_ADDR HYDRA-DC)")
     NEED_KEY=1
   fi
   if [ "$NEED_KEY" -eq 1 ]; then
@@ -238,8 +255,8 @@ if [ "$ACCESS_MODE" = "tailscale" ]; then
     [ "$msg" != "$last" ] && { echo; echo "$msg"; last="$msg"; }
     if [ "$SECONDS" -ge "$deadline" ]; then
       echo "HYDRA-DC bootstrap status:" >&2
-      az vm get-instance-view -g "$RG" -n HYDRA-DC \
-        --query "instanceView.extensions[?name=='enable-winrm'].statuses[].{code:code,msg:message}" -o table >&2 || true
+      az vm run-command show -g "$RG" --vm-name HYDRA-DC --name lab-bootstrap --instance-view \
+        --query "instanceView.{state:executionState,exit:exitCode,error:error}" -o yaml >&2 || true
       die "Tunnel to the lab never came up. Bootstrap log on the VM:
   az vm run-command invoke -g $RG -n HYDRA-DC --command-id RunPowerShellScript --scripts 'Get-Content C:\\WindowsAzure\\lab-bootstrap.log -Tail 40'
 See documentation/tailscale.md -> Troubleshooting."
@@ -251,12 +268,14 @@ fi
 # ---- 5. wait for WinRM -----------------------------------------------------
 winrm_diagnostics() {
   printf '\n\033[1;31mWinRM did not come up on: %s\033[0m\n' "$*" >&2
-  echo "CustomScript (enable-winrm) extension status:" >&2
+  echo "Bootstrap (Run Command lab-bootstrap) status:" >&2
   for h in "$@"; do
     echo "--- $h" >&2
-    az vm get-instance-view -g "$RG" -n "$h" \
-      --query "instanceView.extensions[?name=='enable-winrm'].statuses[].{code:code,msg:message}" -o table >&2 || true
+    az vm run-command show -g "$RG" --vm-name "$h" --name lab-bootstrap --instance-view \
+      --query "instanceView.{state:executionState,exit:exitCode,error:error,output:output}" -o yaml 2>&1 | tail -25 >&2 || true
   done
+  echo "Defender detections that could have killed it (should be none):" >&2
+  echo "  az vm run-command invoke -g $RG -n <VM> --command-id RunPowerShellScript --scripts 'Get-MpThreatDetection | Select InitialDetectionTime,ThreatID,ProcessName'" >&2
   cat >&2 <<EOF
 
 Next steps:
@@ -265,7 +284,8 @@ Next steps:
   * Check the listener directly (no WinRM needed):
       az vm run-command invoke -g $RG -n <VM> --command-id RunPowerShellScript \\
         --scripts "winrm enumerate winrm/config/listener; Get-Content C:\\WindowsAzure\\lab-bootstrap.log -Tail 30"
-  * Re-run the bootstrap:  TF_VAR_tailscale_auth_key=tskey-... terraform -chdir=terraform apply -replace='azurerm_virtual_machine_extension.winrm["<VM>"]'
+  * Re-run just one bootstrap:  terraform -chdir=terraform apply -replace='azurerm_virtual_machine_run_command.bootstrap["<VM>"]'
+    (HYDRA-DC also needs TF_VAR_tailscale_auth_key — ./deploy-azure.sh supplies it from make setup)
   * Then simply re-run ./deploy-azure.sh (everything is idempotent).
 See documentation/troubleshooting.md → "WinRM never comes up".
 EOF

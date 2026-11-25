@@ -14,10 +14,11 @@ locals {
   tailnet    = var.access_mode == "tailscale"
   public     = var.access_mode == "public"
 
-  # One bootstrap per VM, rendered from the template. Only HYDRA-DC installs
-  # Tailscale. Passed inline as gzip+base64 so nothing extra is downloaded and
-  # the command stays well under cmd.exe's 8191-char limit (the precondition on
-  # the extension enforces it).
+  # One bootstrap per VM, rendered from the template (only HYDRA-DC installs
+  # Tailscale). Delivered by managed Run Command as a plain .ps1 FILE. Never
+  # wrap it in an encoded/compressed in-memory loader: Defender's behaviour
+  # monitor kills that as Behavior:Win32/PShellCobStager and the run "succeeds"
+  # silently. The Tailscale key is a protected parameter, not script text.
   bootstrap = {
     for name in concat(["HYDRA-DC"], keys(var.workstation_ips)) : name => templatefile(
       "${path.module}/scripts/bootstrap.ps1.tftpl", {
@@ -26,18 +27,8 @@ locals {
         hostname          = var.tailscale_hostname
         routes            = var.address_space
         tags              = join(",", var.tailscale_tags)
-        auth_key          = replace(var.tailscale_auth_key, "'", "''")
       }
     )
-  }
-  bootstrap_command = {
-    for name, script in local.bootstrap : name => join("", [
-      "powershell -NoProfile -ExecutionPolicy Bypass -Command \"",
-      "$z=New-Object IO.MemoryStream(,[Convert]::FromBase64String('${base64gzip(script)}'));",
-      "$g=New-Object IO.Compression.GzipStream($z,[IO.Compression.CompressionMode]::Decompress);",
-      "$t=(New-Object IO.StreamReader($g,[Text.Encoding]::UTF8)).ReadToEnd();",
-      "& ([ScriptBlock]::Create($t))\"",
-    ])
   }
 
   all_vm_ids = merge(
@@ -173,34 +164,51 @@ resource "azurerm_windows_virtual_machine" "ws" {
 }
 
 # ---------- Bootstrap every VM (WinRM/HTTPS; + Tailscale on HYDRA-DC) ----------
-resource "azurerm_virtual_machine_extension" "winrm" {
-  for_each                   = local.all_vm_ids
-  name                       = "enable-winrm"
-  virtual_machine_id         = each.value
-  publisher                  = "Microsoft.Compute"
-  type                       = "CustomScriptExtension"
-  type_handler_version       = "1.10"
-  auto_upgrade_minor_version = true
+# Managed Run Command: Azure writes source.script to a .ps1 on the VM and runs it
+# synchronously; instance_view reports the real exit code, so a failing script
+# fails `terraform apply` (postcondition) instead of "succeeding" silently.
+# It re-runs whenever the script changes or the resource is replaced
+# (deploy-azure.sh replaces any whose last run failed).
+resource "azurerm_virtual_machine_run_command" "bootstrap" {
+  for_each           = local.all_vm_ids
+  name               = "lab-bootstrap"
+  location           = azurerm_resource_group.lab.location
+  virtual_machine_id = each.value
 
-  # protected_settings: encrypted, never shown in the VM's instance view
-  # (it carries the Tailscale auth key).
-  protected_settings = jsonencode({
-    commandToExecute = local.bootstrap_command[each.key]
-  })
+  source {
+    script = local.bootstrap[each.key]
+  }
+
+  # Encrypted, never shown in the run command's properties or instance view.
+  # Only HYDRA-DC gets it, and only when a key is supplied (Azure rejects empty
+  # values). nonsensitive() exposes only WHETHER a key is set, never the key.
+  dynamic "protected_parameter" {
+    for_each = each.key == "HYDRA-DC" && nonsensitive(var.tailscale_auth_key != "") ? [1] : []
+    content {
+      name  = "TsAuthKey"
+      value = var.tailscale_auth_key
+    }
+  }
 
   lifecycle {
-    # The bootstrap is a one-shot. Don't re-run it just because the (one-time)
-    # auth key isn't supplied on later runs. To force a re-run:
-    #   terraform -chdir=terraform apply -replace='azurerm_virtual_machine_extension.winrm["HYDRA-DC"]'
-    ignore_changes = [protected_settings]
+    # The key is only supplied when the DC's bootstrap has to (re)run; don't
+    # treat its absence on later runs as a change that re-executes the script.
+    ignore_changes = [protected_parameter]
 
-    precondition {
-      condition     = length(local.bootstrap_command[each.key]) < 8000
-      error_message = "Bootstrap command for ${each.key} exceeds cmd.exe's length limit — shorten terraform/scripts/bootstrap.ps1.tftpl."
+    postcondition {
+      condition = try(self.instance_view[0].exit_code, 1) == 0
+      error_message = join("", [
+        "Bootstrap on ${each.key} failed (exit ${try(self.instance_view[0].exit_code, "?")}, ",
+        "${try(self.instance_view[0].execution_state, "?")}): ",
+        trimspace(try(self.instance_view[0].error_message, "")),
+        " | Log on the VM: C:\\WindowsAzure\\lab-bootstrap.log. Fix the cause, then re-run ./deploy-azure.sh ",
+        "(it re-runs only failed bootstraps)."
+      ])
     }
   }
 
   timeouts {
-    create = "30m"
+    create = "40m"
+    update = "40m"
   }
 }

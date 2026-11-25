@@ -107,8 +107,9 @@ It's stored in `.secrets/tailscale-authkey`: gitignored, mode 0600, never in tfv
 (`TS_AUTHKEY=tskey-... ./deploy-azure.sh` overrides the stored key for one run.)
 
 The key goes to Terraform only as an environment variable (`TF_VAR_tailscale_auth_key`). It is
-**never written to tfvars**, and it travels to the VM in the extension's encrypted
-`protected_settings`. It does end up in the local `terraform.tfstate`, which is gitignored and
+**never written to tfvars**, and it travels to the VM as the Run Command's encrypted
+*protected parameter* (`TsAuthKey`). It is never part of the script text, which Azure shows in
+the Run Command's properties. It does end up in the local `terraform.tfstate`, which is gitignored and
 marked sensitive. To be thorough, after the build revoke the key in the admin console and
 delete it locally (`make setup`, step 5, or `rm .secrets/tailscale-authkey`). The DC stays
 connected.
@@ -157,7 +158,7 @@ key. Then run `./deploy-azure.sh`: it detects the switch and re-runs the DC's bo
 |---|---|
 | `Tailscale on this machine is 'NeedsLogin'` | `sudo tailscale up --accept-routes` |
 | `does not accept subnet routes` | `sudo tailscale set --accept-routes` |
-| Extension status: `LAB-BOOTSTRAP ERROR: Tailscale rejected the tag tag:adlab` | Your policy doesn't own the tag. Add `"tagOwners": { "tag:adlab": ["autogroup:admin"] }` (§2), create a **new** key tagged `tag:adlab`, store it with `make setup`, and re-run `./deploy-azure.sh`. WinRM on the DC is already configured, so only the bootstrap re-runs. |
+| `terraform apply` fails: `Bootstrap on HYDRA-DC failed … LAB-BOOTSTRAP ERROR: Tailscale rejected the tag tag:adlab` | Your policy doesn't own the tag. Add `"tagOwners": { "tag:adlab": ["autogroup:admin"] }` (§2), create a **new** key tagged `tag:adlab`, store it with `make setup`, and re-run `./deploy-azure.sh`. WinRM on the DC is already configured, so only the bootstrap re-runs. |
 | `LAB-BOOTSTRAP ERROR: Tailscale rejected the auth key` | The key is expired, revoked, single-use and already used, or ephemeral. Create a new one (reusable, not ephemeral, tagged), then `make setup` and re-run. |
 | `marvel-hydra-dc has not joined the tailnet yet` (until timeout) | The bootstrap failed. Read its log: `az vm run-command invoke -g rg-adlab-marvel -n HYDRA-DC --command-id RunPowerShellScript --scripts "Get-Content C:\WindowsAzure\lab-bootstrap.log -Tail 40"`. Usual causes: an expired, ephemeral or untagged key, or a tag not listed in `tagOwners`. Re-run with a new key: `TF_VAR_tailscale_auth_key=tskey-... terraform -chdir=terraform apply -replace='azurerm_virtual_machine_extension.winrm["HYDRA-DC"]'` |
 | `online but route 10.0.2.0/24 is not approved` | Add the `autoApprovers` block, or approve it under **Machines → marvel-hydra-dc → Edit route settings** |

@@ -40,3 +40,13 @@ output "inventory_path" {
   description = "Generated Ansible inventory"
   value       = abspath(local_file.ansible_inventory.filename)
 }
+
+output "bootstrap_status" {
+  description = "Per-VM bootstrap result (managed Run Command): exit code + state"
+  value = {
+    for k, rc in azurerm_virtual_machine_run_command.bootstrap : k => {
+      exit_code = try(rc.instance_view[0].exit_code, null)
+      state     = try(rc.instance_view[0].execution_state, null)
+    }
+  }
+}

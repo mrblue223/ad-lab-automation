@@ -1,0 +1,13 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+
+# Lock all inbound management to your IP. Get it with:  curl ifconfig.me
+allowed_source_ip = "203.0.113.45/32"
+
+# VM local admin password — 12+ chars, 3 of 4 character classes.
+# Keep this in sync with ansible/inventory/azure.ini ansible_password.
+admin_password = "ChangeMe-Str0ngP@ss!"
+
+# Optional overrides:
+# location            = "canadacentral"
+# vm_size             = "Standard_B2s"
+# resource_group_name = "rg-adlab-marvel"

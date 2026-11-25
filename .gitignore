@@ -1,0 +1,18 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+crash.log
+# Vagrant
+.vagrant/
+# Ansible
+*.retry
+ansible/collections/
+# Secrets
+*.pem
+*.key
+
+# Auto-generated at deploy time
+ansible/inventory/azure_generated.ini
+ATTACK_FROM_KALI.txt

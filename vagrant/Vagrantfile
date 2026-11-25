@@ -1,0 +1,64 @@
+# =============================================================================
+#  Vagrantfile — local VirtualBox deploy of the MARVEL.local lab
+#
+#  Usage:   vagrant up            # builds all 3 VMs
+#           vagrant up hydra-dc   # build one at a time (lower disk pressure)
+#           vagrant destroy -f    # tear it all down
+#
+#  After `vagrant up`, configure the domain with Ansible:
+#           cd ../ansible && ansible-playbook -i inventory/vagrant.ini site.yml
+#
+#  NOTE on disk: the Windows base boxes are several GB each. If disk is tight,
+#  bring VMs up one at a time, or use the Terraform/Azure path instead.
+# =============================================================================
+
+Vagrant.configure("2") do |config|
+  config.vm.boot_timeout = 600
+  config.winrm.timeout   = 300
+  config.winrm.retry_limit = 30
+
+  # Shared VirtualBox sizing
+  def sizing(vb, mb, cpus)
+    vb.memory = mb
+    vb.cpus   = cpus
+    vb.gui    = false
+    vb.customize ["modifyvm", :id, "--nat-localhostreachable1", "on"]
+  end
+
+  # ---- Domain Controller: Windows Server 2022 -----------------------------
+  config.vm.define "hydra-dc" do |dc|
+    dc.vm.box      = "gusztavvargadr/windows-server-2022-standard"
+    dc.vm.hostname = "HYDRA-DC"
+    dc.vm.network "private_network", ip: "10.0.2.10", virtualbox__intnet: "PEH-Lab"
+    # WinRM forwarded for Ansible
+    dc.vm.network "forwarded_port", guest: 5985, host: 55985, id: "winrm"
+    dc.vm.provider "virtualbox" do |vb|
+      vb.name = "HYDRA-DC"
+      sizing(vb, 4096, 2)
+    end
+  end
+
+  # ---- Workstation 1: THEPUNISHER -----------------------------------------
+  config.vm.define "thepunisher" do |ws|
+    ws.vm.box      = "gusztavvargadr/windows-10-enterprise"
+    ws.vm.hostname = "THEPUNISHER"
+    ws.vm.network "private_network", ip: "10.0.2.11", virtualbox__intnet: "PEH-Lab"
+    ws.vm.network "forwarded_port", guest: 5985, host: 55986, id: "winrm"
+    ws.vm.provider "virtualbox" do |vb|
+      vb.name = "THEPUNISHER"
+      sizing(vb, 4096, 2)
+    end
+  end
+
+  # ---- Workstation 2: SPIDERMAN -------------------------------------------
+  config.vm.define "spiderman" do |ws|
+    ws.vm.box      = "gusztavvargadr/windows-10-enterprise"
+    ws.vm.hostname = "SPIDERMAN"
+    ws.vm.network "private_network", ip: "10.0.2.12", virtualbox__intnet: "PEH-Lab"
+    ws.vm.network "forwarded_port", guest: 5985, host: 55987, id: "winrm"
+    ws.vm.provider "virtualbox" do |vb|
+      vb.name = "SPIDERMAN"
+      sizing(vb, 4096, 2)
+    end
+  end
+end

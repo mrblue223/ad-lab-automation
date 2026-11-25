@@ -1,0 +1,75 @@
+---
+# =============================================================================
+#  Role: domain_member
+#  Configures a Windows 10 workstation: static IP, DNS at the DC, domain join,
+#  local-admin seeding, and the lab weakenings (firewall + Defender off).
+# =============================================================================
+
+# ---- 1. Networking (DNS must point at the DC before the join) --------------
+- name: Set static IPv4 + DNS pointing at the DC
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $ifn = (Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1).Name
+      Get-NetIPAddress -InterfaceAlias $ifn -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+      Remove-NetRoute -InterfaceAlias $ifn -Confirm:$false -ErrorAction SilentlyContinue
+      New-NetIPAddress -InterfaceAlias $ifn -IPAddress '{{ ws_ip }}' `
+        -PrefixLength 24 -DefaultGateway '{{ gateway }}'
+      Set-DnsClientServerAddress -InterfaceAlias $ifn -ServerAddresses '{{ dc_ip }}'
+  changed_when: false
+  failed_when: false
+
+- name: Wait for the DC's DNS to resolve the domain
+  ansible.windows.win_powershell:
+    script: "Resolve-DnsName {{ domain_name }} -Server {{ dc_ip }} | Out-Null"
+  register: dns_ok
+  retries: 10
+  delay: 15
+  until: dns_ok.error is not defined
+  changed_when: false
+
+# ---- 2. Rename + domain join ----------------------------------------------
+- name: Set hostname
+  ansible.windows.win_hostname:
+    name: "{{ ws_name }}"
+  register: ws_rename
+
+- name: Reboot after rename
+  ansible.windows.win_reboot:
+  when: ws_rename.reboot_required
+
+- name: Join {{ domain_name }}
+  microsoft.ad.membership:
+    dns_domain_name: "{{ domain_name }}"
+    domain_admin_user: "{{ domain_netbios }}\\Administrator"
+    domain_admin_password: "{{ domain_admin_password }}"
+    state: domain
+    reboot: true
+
+# ---- 3. Seed local admins (enables psexec / relay path) ---------------------
+- name: Add domain users to local Administrators
+  ansible.windows.win_group_membership:
+    name: Administrators
+    members: "{{ local_admins }}"
+    state: present
+
+# ---- 4. Lab weakenings -----------------------------------------------------
+- name: Disable Windows Firewall (opens SMB for relay/psexec)
+  ansible.windows.win_powershell:
+    script: "Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False"
+  when: disable_firewall | bool
+  changed_when: false
+
+- name: Disable Defender real-time protection
+  ansible.windows.win_powershell:
+    script: |
+      Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+      # gpupdate pulls the DC's Defender GPO as well
+      gpupdate /force | Out-Null
+  when: disable_defender | bool
+  changed_when: false
+
+- name: "LAB NOTE — workstation ready"
+  ansible.builtin.debug:
+    msg: "{{ ws_name }} ({{ ws_ip }}) joined {{ domain_name }}; local admins: {{ local_admins | join(', ') }}"

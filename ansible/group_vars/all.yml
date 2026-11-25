@@ -1,0 +1,63 @@
+---
+# =============================================================================
+#  MARVEL.local lab — single source of truth
+#  Both the Vagrant (local) and Terraform (Azure) deploy paths consume this.
+#  Everything about the domain is defined here; the roles just apply it.
+# =============================================================================
+
+# ---- Domain ----------------------------------------------------------------
+domain_name: "MARVEL.local"
+domain_netbios: "MARVEL"
+
+# DSRM / Safe-mode recovery password for the DC
+dsrm_password: "DSRMp@ssw0rd!2026"
+
+# ---- Hosts -----------------------------------------------------------------
+# IPs are what the roles pin statically. The Vagrant private network and the
+# Terraform subnet are both sized to match 10.0.2.0/24.
+dc_hostname: "HYDRA-DC"
+dc_ip: "10.0.2.10"
+
+workstations:
+  - name: "THEPUNISHER"
+    ip: "10.0.2.11"
+  - name: "SPIDERMAN"
+    ip: "10.0.2.12"
+
+subnet_cidr: "10.0.2.0/24"
+subnet_mask: "255.255.255.0"
+gateway: "10.0.2.1"
+
+# ---- Domain users ----------------------------------------------------------
+# Intentionally weak / misconfigured — this is a deliberately vulnerable lab.
+# Do NOT reuse these anywhere real.
+domain_users:
+  - { first: "Tony",  last: "Stark",   sam: "tstark",      password: "P@$$w0rd",       domain_admin: true  }
+  - { first: "Frank", last: "Castle",  sam: "fcastle",     password: "Password1",      domain_admin: false }
+  - { first: "Peter", last: "Parker",  sam: "pparker",     password: "Password2",      domain_admin: false }
+  - { first: "SQL",   last: "Service", sam: "SQL_Service", password: "MYpassword123#", domain_admin: false,
+      description: "The password is MYpassword123#" }   # planted creds-in-description finding
+
+# ---- Kerberoasting target (SPN on the service account) ---------------------
+spn:
+  account: "SQL_Service"
+  value: "HYDRA-DC/SQL_Service.MARVEL.local:60111"
+
+# ---- SMB share -------------------------------------------------------------
+smb_share:
+  name: "hackme"
+  path: "C:\\Shares\\hackme"
+
+# ---- Local admin seeding on workstations -----------------------------------
+# fcastle as local admin on both workstations enables the psexec / SMB-relay path.
+local_admins:
+  - "MARVEL\\fcastle"
+
+# ---- Deliberate weakenings (lab only) --------------------------------------
+disable_defender: true      # turn off Defender AV so payloads land
+disable_firewall: true      # open SMB (445) for relay / psexec
+disable_llmnr: false        # keep LLMNR ON so the poisoning attack works
+
+# ---- WinRM / connection creds (set per-platform at deploy time) ------------
+# Vagrant uses vagrant/vagrant; Azure uses the admin set in terraform.tfvars.
+# These are overridden by the inventory, not hard-coded here.

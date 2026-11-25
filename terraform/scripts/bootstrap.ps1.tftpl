@@ -1,22 +1,73 @@
-# VM bootstrap (runs once via the CustomScript extension; safe to re-run).
+# VM bootstrap (CustomScript extension). Idempotent: safe to re-run on any VM.
 #  * every VM : WinRM over HTTPS on 5986 for Ansible (self-signed cert, NTLM, no Basic)
 #  * HYDRA-DC : (tailscale mode) join the tailnet + route the lab subnet to it
+# WinRM is configured FIRST, so a Tailscale problem never costs you Ansible access.
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # PS 5.1's progress bar makes downloads crawl
 Start-Transcript -Path C:\WindowsAzure\lab-bootstrap.log -Append | Out-Null
+
+function Fail([string]$msg) {
+  # One clear line in the extension status (stderr) + the transcript, then stop.
+  [Console]::Error.WriteLine("LAB-BOOTSTRAP ERROR: $msg")
+  throw $msg
+}
+
+# Run a native exe, capture stdout+stderr as text and the exit code, without
+# PS 5.1 turning stderr output into a terminating error.
+function Invoke-Native([string]$exe, [string[]]$argv) {
+  $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  try { $out = (& $exe @argv 2>&1 | ForEach-Object { "$_" }) -join "`n" } finally { $ErrorActionPreference = $eap }
+  [pscustomobject]@{ Code = $LASTEXITCODE; Output = $out }
+}
+
 try {
-  # ---- WinRM / HTTPS ----
-  Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null
+  # ---- 1. Network profile -> Private --------------------------------------
+  # Fresh Azure VMs put the NIC in the Public category, and WinRM's firewall
+  # exception refuses to run while ANY profile is Public. Wait out the
+  # "Identifying..." phase, then move every non-domain profile to Private.
+  for ($i = 0; $i -lt 30; $i++) {
+    $profiles = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue)
+    if ($profiles.Count -gt 0) { break }
+    Start-Sleep 5
+  }
+  foreach ($p in $profiles) {
+    if ($p.NetworkCategory -eq 'Public') {
+      try {
+        Set-NetConnectionProfile -InterfaceIndex $p.InterfaceIndex -NetworkCategory Private
+        Write-Output "Network '$($p.Name)' (ifIndex $($p.InterfaceIndex)): Public -> Private"
+      } catch { Write-Warning "Could not set '$($p.Name)' to Private: $_" }
+    }
+  }
+
+  # ---- 2. WinRM -----------------------------------------------------------
+  Set-Service WinRM -StartupType Automatic
+  Start-Service WinRM
+  try {
+    Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null
+  } catch {
+    # Belt and braces: quickconfig with the profile check skipped.
+    Write-Warning "Enable-PSRemoting failed ($_); retrying with Set-WSManQuickConfig"
+    Set-WSManQuickConfig -Force -SkipNetworkProfileCheck | Out-Null
+  }
+
+  # ---- 3. HTTPS listener (5986) -------------------------------------------
   $h = $env:COMPUTERNAME
   $c = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -eq "CN=$h" -and $_.NotAfter -gt (Get-Date).AddDays(30) } | Select-Object -First 1
   if (-not $c) { $c = New-SelfSignedCertificate -DnsName $h -CertStoreLocation Cert:\LocalMachine\My -NotAfter (Get-Date).AddYears(3) }
-  Get-ChildItem WSMan:\localhost\Listener | Where-Object { $_.Keys -contains 'Transport=HTTPS' } | Remove-Item -Recurse -Force
-  New-Item -Path WSMan:\localhost\Listener -Transport HTTPS -Address * -CertificateThumbPrint $c.Thumbprint -Force | Out-Null
+  $https = Get-ChildItem WSMan:\localhost\Listener | Where-Object { $_.Keys -contains 'Transport=HTTPS' }
+  $thumb = if ($https) { (Get-Item "$($https.PSPath)\CertificateThumbprint" -ErrorAction SilentlyContinue).Value } else { $null }
+  if ($thumb -ne $c.Thumbprint) {
+    $https | Remove-Item -Recurse -Force
+    New-Item -Path WSMan:\localhost\Listener -Transport HTTPS -Address * -CertificateThumbPrint $c.Thumbprint -Force | Out-Null
+  }
   Set-Item WSMan:\localhost\Service\Auth\Negotiate -Value $true
   Set-Item WSMan:\localhost\Service\Auth\Basic -Value $false
   Set-Item WSMan:\localhost\Service\AllowUnencrypted -Value $false
   Set-Item WSMan:\localhost\MaxTimeoutms -Value 1800000
   New-ItemProperty -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System -Name LocalAccountTokenFilterPolicy -Value 1 -PropertyType DWord -Force | Out-Null
+
+  # Our own rules, on EVERY profile, so later profile changes (domain join,
+  # the Tailscale adapter) can't close them.
   if (-not (Get-NetFirewallRule -Name WinRM-HTTPS-In -ErrorAction SilentlyContinue)) {
     New-NetFirewallRule -Name WinRM-HTTPS-In -DisplayName 'WinRM HTTPS (Ansible)' -Direction Inbound -Protocol TCP -LocalPort 5986 -Action Allow -Profile Any | Out-Null
   }
@@ -27,36 +78,63 @@ try {
   }
 %{ endif ~}
   Restart-Service WinRM
+  if (-not (Get-ChildItem WSMan:\localhost\Listener | Where-Object { $_.Keys -contains 'Transport=HTTPS' })) { Fail 'WinRM HTTPS listener is missing after setup.' }
+  Write-Output 'WinRM/HTTPS on 5986: OK'
 %{ if install_tailscale ~}
 
-  # ---- Tailscale subnet router (HYDRA-DC only) ----
+  # ---- 4. Tailscale subnet router (HYDRA-DC only) -------------------------
   $ts = 'C:\Program Files\Tailscale\tailscale.exe'
   if (-not (Test-Path $ts)) {
     $msi = Join-Path $env:TEMP 'tailscale.msi'
     [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
-    Invoke-WebRequest -UseBasicParsing -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
+    try {
+      Invoke-WebRequest -UseBasicParsing -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
+    } catch { Fail "Could not download Tailscale (no outbound internet?): $_" }
     $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/i', $msi, '/qn', '/norestart', 'TS_UNATTENDEDMODE=always')
-    if ($p.ExitCode -notin 0, 3010) { throw "Tailscale MSI failed with exit code $($p.ExitCode)" }
+    if ($p.ExitCode -notin 0, 3010) { Fail "Tailscale MSI failed with exit code $($p.ExitCode)" }
   }
   for ($i = 0; $i -lt 60 -and (Get-Service Tailscale -ErrorAction SilentlyContinue).Status -ne 'Running'; $i++) { Start-Sleep 2 }
 
   # Route between the tailnet and the lab NIC. Registry = persistent, Set-NetIPInterface = now.
   Set-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters -Name IPEnableRouter -Value 1 -Type DWord
 
-  # (no 2>$null: in Windows PowerShell 5.1 redirected native stderr becomes a terminating error)
-  $state = try { (& $ts status --json | Out-String | ConvertFrom-Json).BackendState } catch { $null }
+  $st = Invoke-Native $ts @('status', '--json')
+  $state = try { ($st.Output | ConvertFrom-Json).BackendState } catch { $null }
+
+  # --advertise-tags MUST equal the auth key's tags when the key is tagged
+  # (recommended: key tagged ${tags}). For an untagged key, the key's owner
+  # must be listed in tagOwners for ${tags}.
   $tsArgs = @('--hostname=${hostname}', '--advertise-routes=${routes}', '--advertise-tags=${tags}',
-              '--accept-dns=false', '--accept-routes=false', '--unattended')
+              '--accept-dns=false', '--accept-routes=false', '--unattended', '--timeout=120s')
   if ($state -ne 'Running') {
     $key = '${auth_key}'
-    if (-not $key) { throw 'Tailscale auth key missing: run deploy-azure.sh with TS_AUTHKEY set (see documentation/tailscale.md).' }
-    & $ts up "--auth-key=$key" @tsArgs --timeout=120s
-    if ($LASTEXITCODE -ne 0) { throw "tailscale up failed ($LASTEXITCODE): check the key is valid, reusable, and tagged ${tags}." }
+    if (-not $key) { Fail 'No Tailscale auth key was supplied. Run `make setup` (step 5) to store one, then re-run ./deploy-azure.sh.' }
+    # Output is captured (never echoed raw) and the key is redacted from any error.
+    $r = Invoke-Native $ts (@('up', "--auth-key=$key") + $tsArgs)
+    if ($r.Code -ne 0) {
+      $o = $r.Output -replace [regex]::Escape($key), '<auth-key>'
+      if ($o -match 'tags?.*(invalid|not permitted)') {
+        Fail ("Tailscale rejected the tag ${tags}. In https://login.tailscale.com/admin/acls add " +
+              '"tagOwners": { "${tags}": ["autogroup:admin"] } (see documentation/tailscale.md section 2), ' +
+              'then create a NEW auth key with tag ${tags} (reusable, not ephemeral), store it with `make setup`, ' +
+              'and re-run ./deploy-azure.sh. WinRM on this VM is already configured. Tailscale said: ' + $o)
+      } elseif ($o -match '(invalid key|key.*(expired|not valid|revoked)|unauthorized|401)') {
+        Fail ('Tailscale rejected the auth key (expired, revoked, used ephemeral/single-use, or mistyped). ' +
+              'Create a new one (reusable, NOT ephemeral, tag ${tags}), store it with `make setup`, re-run ./deploy-azure.sh. Tailscale said: ' + $o)
+      } elseif ($o -match '(timeout|timed out|context deadline|no route|dial)') {
+        Fail ('tailscale up timed out reaching the coordination server: check the VNet has outbound internet ' +
+              '(default outbound access or enable_nat_gateway). Tailscale said: ' + $o)
+      } else {
+        Fail "tailscale up failed (exit $($r.Code)): $o"
+      }
+    }
   } else {
-    & $ts set --advertise-routes=${routes} --accept-dns=false --accept-routes=false
+    $r = Invoke-Native $ts @('set', '--advertise-routes=${routes}', '--accept-dns=false', '--accept-routes=false')
+    if ($r.Code -ne 0) { Fail "tailscale set failed (exit $($r.Code)): $($r.Output)" }
   }
   Get-NetIPInterface -AddressFamily IPv4 | Set-NetIPInterface -Forwarding Enabled
-  & $ts status
+  Write-Output ((Invoke-Native $ts @('status')).Output)
+  Write-Output 'Tailscale subnet router: OK'
 %{ endif ~}
 } finally {
   Stop-Transcript | Out-Null

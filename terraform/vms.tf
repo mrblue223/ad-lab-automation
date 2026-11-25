@@ -15,8 +15,9 @@ locals {
   public     = var.access_mode == "public"
 
   # One bootstrap per VM, rendered from the template. Only HYDRA-DC installs
-  # Tailscale. Passed inline (base64, UTF-8) so nothing extra is downloaded and
-  # it stays well under cmd.exe's 8191-char command-line limit.
+  # Tailscale. Passed inline as gzip+base64 so nothing extra is downloaded and
+  # the command stays well under cmd.exe's 8191-char limit (the precondition on
+  # the extension enforces it).
   bootstrap = {
     for name in concat(["HYDRA-DC"], keys(var.workstation_ips)) : name => templatefile(
       "${path.module}/scripts/bootstrap.ps1.tftpl", {
@@ -30,8 +31,13 @@ locals {
     )
   }
   bootstrap_command = {
-    for name, script in local.bootstrap : name =>
-    "powershell -NoProfile -ExecutionPolicy Bypass -Command \"& ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${base64encode(script)}'))))\""
+    for name, script in local.bootstrap : name => join("", [
+      "powershell -NoProfile -ExecutionPolicy Bypass -Command \"",
+      "$z=New-Object IO.MemoryStream(,[Convert]::FromBase64String('${base64gzip(script)}'));",
+      "$g=New-Object IO.Compression.GzipStream($z,[IO.Compression.CompressionMode]::Decompress);",
+      "$t=(New-Object IO.StreamReader($g,[Text.Encoding]::UTF8)).ReadToEnd();",
+      "& ([ScriptBlock]::Create($t))\"",
+    ])
   }
 
   all_vm_ids = merge(
@@ -118,6 +124,12 @@ resource "azurerm_windows_virtual_machine" "dc" {
     caching              = "ReadWrite"
     storage_account_type = "StandardSSD_LRS"
   }
+  # Azure turns this on for new VMs; azurerm 3.x models it as false, which
+  # would otherwise show a perpetual in-place "update" on every plan.
+  lifecycle {
+    ignore_changes = [vm_agent_platform_updates_enabled]
+  }
+
   source_image_reference {
     publisher = var.dc_image.publisher
     offer     = var.dc_image.offer
@@ -146,6 +158,12 @@ resource "azurerm_windows_virtual_machine" "ws" {
     caching              = "ReadWrite"
     storage_account_type = "StandardSSD_LRS"
   }
+  # Azure turns this on for new VMs; azurerm 3.x models it as false, which
+  # would otherwise show a perpetual in-place "update" on every plan.
+  lifecycle {
+    ignore_changes = [vm_agent_platform_updates_enabled]
+  }
+
   source_image_reference {
     publisher = local.ws_image.publisher
     offer     = local.ws_image.offer

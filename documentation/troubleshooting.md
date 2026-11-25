@@ -73,6 +73,30 @@ downloads anything: the Tailscale MSI, from pkgs.tailscale.com. It
 replaced the deprecated `ConfigureRemotingForAnsible.ps1`, which was pulled from GitHub's
 `devel` branch and failed on client OSes whose network profile is "Public".
 
+## Bootstrap failed: "network connection types … set to Public"
+
+Fresh Azure VMs, Windows 11 in particular, start with the NIC in the **Public** network
+category, and WinRM refuses to create its firewall exception while any profile is Public. The
+bootstrap now waits for the network to finish "Identifying", moves every non-domain profile to
+**Private**, and only then enables WinRM. It also falls back to `Set-WSManQuickConfig
+-SkipNetworkProfileCheck` if needed. Its own 5986 and tailnet firewall rules apply to *every*
+profile, so later changes (domain join, the Tailscale adapter) can't close them.
+
+## Re-running after a failed bootstrap
+
+A failed CustomScript run leaves the `enable-winrm` extension in Azure in the **Failed** state
+but *not* in Terraform state. azurerm then refuses to create it ("already exists – needs to be
+imported"), and extensions can't be installed on deallocated VMs at all. `./deploy-azure.sh`
+repairs both before applying:
+
+1. It starts any stopped or deallocated lab VMs.
+2. For each VM it compares Terraform state with Azure. It deletes orphaned or Failed extensions
+   (or forces `-replace`), so only the bootstraps re-run. **VMs are never rebuilt.**
+3. If HYDRA-DC's bootstrap is re-running, it requires the Tailscale key stored by `make setup`.
+
+The bootstrap log on each VM is `C:\WindowsAzure\lab-bootstrap.log`. The extension status shows a
+single `LAB-BOOTSTRAP ERROR: …` line that names the fix.
+
 ## Domain join fails / bad credentials
 
 **The old bug:** the inventory hardcoded `dc_admin_password=P@$$w0rd` and the join used

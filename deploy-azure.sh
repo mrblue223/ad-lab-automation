@@ -58,7 +58,12 @@ ANSIBLE_PY="$(ansible --version | sed -n 's/.*python version = .*(\([^)]*\))$/\1
        pipx Ansible: pipx inject ansible-core pywinrm   (or: pipx inject ansible pywinrm)"
 
 az account show >/dev/null 2>&1 || die "Not logged into Azure. Run: az login"
-az account show --query '{subscription:name, id:id, user:user.name}' -o yaml
+# Show which subscription is in use without printing your account email or the
+# full subscription id (keeps pasted logs free of personal data).
+az account show --query '[name, id]' -o tsv | {
+  read -r sub_name; read -r sub_id
+  echo "Azure subscription: $sub_name (${sub_id:0:4}…${sub_id: -4})"
+}
 
 say "Installing Ansible collections (idempotent)"
 ansible-galaxy collection install -r ansible/requirements.yml >/dev/null

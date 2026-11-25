@@ -51,8 +51,13 @@ domain_users:
     last: "Service"
     sam: "SQL_Service"
     password: "MYpassword123#"
-    domain_admin: false
+    domain_admin: true                              # service acct over-privileged as DA (weakness #1)
     description: "The password is MYpassword123#"   # planted creds-in-description finding
+    # msDS-SupportedEncryptionTypes = 4 => RC4_HMAC only. THE key setting: without
+    # it, Server 2022's KDC issues an AES service ticket (or rejects the roast with
+    # KDC_ERR_ETYPE_NOSUPP), so GetUserSPNs returns an uncrackable hash. Forcing
+    # RC4 makes the roast come back as $krb5tgs$23$ and crackable offline.
+    supported_enc_types: 4
 
 # Groups every `domain_admin: true` user gets. In the course, tstark is created
 # by copying Administrator, so he carries all of these.

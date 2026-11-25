@@ -77,6 +77,15 @@
       if ((Get-SmbClientConfiguration).RequireSecuritySignature) {
         Set-SmbClientConfiguration -RequireSecuritySignature $false -Force; $changed = $true
       }
+      # Win11 24H2 / Server 2025 (build 26100+) client editions require inbound SMB
+      # signing by default. Set-SmbServerConfiguration writes the config, but the
+      # SMB2 "signing required" flag the server advertises on the wire — the one
+      # ntlmrelayx/nxc read — is only re-evaluated when the Server service restarts.
+      # Without this bounce the setting reads $false yet nxc still shows signing:True
+      # and SMB relay fails. Restart LanmanServer (+ its dependents) on any change.
+      if ($changed) {
+        Restart-Service -Name LanmanServer -Force
+      }
       $Ansible.Changed = $changed
   when: disable_smb_signing | bool
 

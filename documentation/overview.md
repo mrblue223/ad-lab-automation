@@ -18,12 +18,13 @@ against infrastructure you own. The repo only *deploys* the lab; it contains no 
 | `tstark` / `P@$$w0rd` | Domain Admin. Like the course's copy of Administrator, he is also in Enterprise Admins, Schema Admins and Group Policy Creator Owners. |
 | `fcastle` / `Password1` | Standard user, **local admin on both workstations** |
 | `pparker` / `Password2` | Standard user |
-| `SQL_Service` / `MYpassword123#` | Service account: **SPN** `HYDRA-DC/SQL_Service.MARVEL.local:60111`, **password stored in its Description** |
+| `SQL_Service` / `MYpassword123#` | **Domain Admin** service account: **SPN** `HYDRA-DC/SQL_Service.MARVEL.local:60111`, **RC4-only** (`msDS-SupportedEncryptionTypes = 4`) so the roast returns a crackable `$krb5tgs$23$` ticket, and **password stored in its Description** |
 
 The weaknesses are intentional. All passwords are set to never expire. SMB signing is not
 required on the workstations. Defender is disabled (by a GPO plus a local setting), the
-workstation firewalls are off, and LLMNR is left on. There is also an open `\\HYDRA-DC\hackme`
-share.
+workstation **and DC** firewalls are off, and LLMNR is left on. There is also an open
+`\\HYDRA-DC\hackme` share. The full catalogue — intended attack and real-world mitigation per
+item — is in [vulnerabilities.md](vulnerabilities.md).
 
 **Single source of truth:** all of the above is defined in
 [`ansible/group_vars/all.yml`](../ansible/group_vars/all.yml). Change something there once and

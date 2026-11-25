@@ -159,6 +159,11 @@
     enabled: true
     description: "{{ item.description | default(omit) }}"
     spn: "{{ {'add': [spn.value]} if item.sam == spn.account else omit }}"
+    # Force RC4-only Kerberos (msDS-SupportedEncryptionTypes = 4) on accounts that
+    # ask for it, so the roast on Server 2022 returns a crackable $krb5tgs$23$ RC4
+    # ticket instead of an AES ticket or KDC_ERR_ETYPE_NOSUPP. Idempotent: the
+    # module only writes the attribute when it differs.
+    attributes: "{{ {'set': {'msDS-SupportedEncryptionTypes': item.supported_enc_types}} if item.supported_enc_types is defined else omit }}"
     state: present
   loop: "{{ domain_users }}"
   loop_control:
@@ -238,6 +243,28 @@
         }
       }
       $Ansible.Changed = $changed
+  when: disable_defender | bool
+
+- name: Disable Windows Firewall on the DC (opens SMB/LDAP for the lab)
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $on = Get-NetFirewallProfile | Where-Object Enabled
+      if ($on) { $on | Set-NetFirewallProfile -Enabled False } else { $Ansible.Changed = $false }
+  when: disable_firewall | bool
+
+- name: Apply the Defender-disable policy locally on the DC now
+  ansible.windows.win_powershell:
+    script: |
+      $Ansible.Changed = $false
+      $mp = Get-MpPreference -ErrorAction SilentlyContinue
+      if ($mp -and -not $mp.DisableRealtimeMonitoring) {
+        # The domain GPO above is the backstop; this makes it effective on the DC
+        # immediately instead of at the next policy refresh. Tamper Protection may veto.
+        Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+        $Ansible.Changed = $true
+      }
+      gpupdate /force | Out-Null
   when: disable_defender | bool
 
 - name: "LAB NOTE — DC summary"

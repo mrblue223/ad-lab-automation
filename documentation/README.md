@@ -3,6 +3,7 @@
 | Doc | What's in it |
 |---|---|
 | [overview.md](overview.md) | What the PNPT / PEH `MARVEL.local` lab is, and how the Azure build is put together |
+| [vulnerabilities.md](vulnerabilities.md) | **The deliberate weaknesses** — per item: where it's configured, the intended attack, the real-world mitigation |
 | [setup/setup-guide.md](setup/setup-guide.md) | Prerequisites, `az login`, **`make setup`** (runtime values → gitignored files) |
 | [runbook.md](runbook.md) | Deploy, verify from Kali, deallocate/start, destroy |
 | [troubleshooting.md](troubleshooting.md) | Image SKUs, VM sizes/quota, WinRM timing, the domain-join credential, clock skew |

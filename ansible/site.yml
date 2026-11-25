@@ -5,13 +5,17 @@
 #  against Vagrant-provisioned VMs and Azure VMs (both reached over WinRM).
 #
 #  Order matters: the DC must be fully promoted before the workstations try to
-#  join, so the two plays run in sequence.
+#  join, so the two plays run in sequence and a DC failure stops the run.
+#
+#  Credentials: workstations join as `lab_admin_user` / `lab_admin_password`
+#  from group_vars/all.yml — no per-platform domain-admin password.
 # =============================================================================
 
 # ---- Play 1: Domain Controller ---------------------------------------------
 - name: Build the Domain Controller
   hosts: dc
   gather_facts: false
+  any_errors_fatal: true
   roles:
     - domain_controller
 
@@ -19,8 +23,5 @@
 - name: Configure domain workstations
   hosts: workstations
   gather_facts: false
-  vars:
-    # per-host name/ip come from inventory; pass the DA password through
-    domain_admin_password: "{{ hostvars['dc']['dc_admin_password'] | default('P@$$w0rd') }}"
   roles:
     - domain_member

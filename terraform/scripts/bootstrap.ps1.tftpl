@@ -1,0 +1,63 @@
+# VM bootstrap (runs once via the CustomScript extension; safe to re-run).
+#  * every VM : WinRM over HTTPS on 5986 for Ansible (self-signed cert, NTLM, no Basic)
+#  * HYDRA-DC : (tailscale mode) join the tailnet + route the lab subnet to it
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'   # PS 5.1's progress bar makes downloads crawl
+Start-Transcript -Path C:\WindowsAzure\lab-bootstrap.log -Append | Out-Null
+try {
+  # ---- WinRM / HTTPS ----
+  Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null
+  $h = $env:COMPUTERNAME
+  $c = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -eq "CN=$h" -and $_.NotAfter -gt (Get-Date).AddDays(30) } | Select-Object -First 1
+  if (-not $c) { $c = New-SelfSignedCertificate -DnsName $h -CertStoreLocation Cert:\LocalMachine\My -NotAfter (Get-Date).AddYears(3) }
+  Get-ChildItem WSMan:\localhost\Listener | Where-Object { $_.Keys -contains 'Transport=HTTPS' } | Remove-Item -Recurse -Force
+  New-Item -Path WSMan:\localhost\Listener -Transport HTTPS -Address * -CertificateThumbPrint $c.Thumbprint -Force | Out-Null
+  Set-Item WSMan:\localhost\Service\Auth\Negotiate -Value $true
+  Set-Item WSMan:\localhost\Service\Auth\Basic -Value $false
+  Set-Item WSMan:\localhost\Service\AllowUnencrypted -Value $false
+  Set-Item WSMan:\localhost\MaxTimeoutms -Value 1800000
+  New-ItemProperty -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System -Name LocalAccountTokenFilterPolicy -Value 1 -PropertyType DWord -Force | Out-Null
+  if (-not (Get-NetFirewallRule -Name WinRM-HTTPS-In -ErrorAction SilentlyContinue)) {
+    New-NetFirewallRule -Name WinRM-HTTPS-In -DisplayName 'WinRM HTTPS (Ansible)' -Direction Inbound -Protocol TCP -LocalPort 5986 -Action Allow -Profile Any | Out-Null
+  }
+%{ if tailnet ~}
+  # Traffic from your tailnet (100.64.0.0/10) arrives via HYDRA-DC; let it in on every profile.
+  if (-not (Get-NetFirewallRule -Name Tailnet-In -ErrorAction SilentlyContinue)) {
+    New-NetFirewallRule -Name Tailnet-In -DisplayName 'Tailnet (via HYDRA-DC)' -Direction Inbound -RemoteAddress 100.64.0.0/10 -Action Allow -Profile Any | Out-Null
+  }
+%{ endif ~}
+  Restart-Service WinRM
+%{ if install_tailscale ~}
+
+  # ---- Tailscale subnet router (HYDRA-DC only) ----
+  $ts = 'C:\Program Files\Tailscale\tailscale.exe'
+  if (-not (Test-Path $ts)) {
+    $msi = Join-Path $env:TEMP 'tailscale.msi'
+    [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
+    Invoke-WebRequest -UseBasicParsing -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
+    $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/i', $msi, '/qn', '/norestart', 'TS_UNATTENDEDMODE=always')
+    if ($p.ExitCode -notin 0, 3010) { throw "Tailscale MSI failed with exit code $($p.ExitCode)" }
+  }
+  for ($i = 0; $i -lt 60 -and (Get-Service Tailscale -ErrorAction SilentlyContinue).Status -ne 'Running'; $i++) { Start-Sleep 2 }
+
+  # Route between the tailnet and the lab NIC. Registry = persistent, Set-NetIPInterface = now.
+  Set-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters -Name IPEnableRouter -Value 1 -Type DWord
+
+  # (no 2>$null: in Windows PowerShell 5.1 redirected native stderr becomes a terminating error)
+  $state = try { (& $ts status --json | Out-String | ConvertFrom-Json).BackendState } catch { $null }
+  $tsArgs = @('--hostname=${hostname}', '--advertise-routes=${routes}', '--advertise-tags=${tags}',
+              '--accept-dns=false', '--accept-routes=false', '--unattended')
+  if ($state -ne 'Running') {
+    $key = '${auth_key}'
+    if (-not $key) { throw 'Tailscale auth key missing: run deploy-azure.sh with TS_AUTHKEY set (see documentation/tailscale.md).' }
+    & $ts up "--auth-key=$key" @tsArgs --timeout=120s
+    if ($LASTEXITCODE -ne 0) { throw "tailscale up failed ($LASTEXITCODE): check the key is valid, reusable, and tagged ${tags}." }
+  } else {
+    & $ts set --advertise-routes=${routes} --accept-dns=false --accept-routes=false
+  }
+  Get-NetIPInterface -AddressFamily IPv4 | Set-NetIPInterface -Forwarding Enabled
+  & $ts status
+%{ endif ~}
+} finally {
+  Stop-Transcript | Out-Null
+}

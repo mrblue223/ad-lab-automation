@@ -1,9 +1,8 @@
 ---
 # Install with: ansible-galaxy collection install -r requirements.yml
+# Python side (controller): pywinrm  ->  Kali: sudo apt install python3-winrm
 collections:
   - name: ansible.windows
-    version: ">=2.3.0"
+    version: ">=2.5.0"
   - name: microsoft.ad
-    version: ">=1.5.0"
-  - name: community.windows
-    version: ">=2.2.0"
+    version: ">=1.7.0"

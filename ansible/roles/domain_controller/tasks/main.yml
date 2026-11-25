@@ -3,37 +3,57 @@
 #  Role: domain_controller
 #  Promotes HYDRA-DC to a new forest, installs AD CS, and applies the full
 #  MARVEL.local config (users, groups, SPN, share, Defender GPO).
+#  Every task is idempotent: re-running site.yml converges with no errors.
 # =============================================================================
 
-# ---- 1. Networking ---------------------------------------------------------
-- name: Set static IPv4 address on the DC
+# ---- 1. Pre-flight ---------------------------------------------------------
+# The guest stays on DHCP: Azure hands out the NIC's static private IP via a
+# DHCP reservation, and Vagrant's private_network pins it. Rewriting the IP
+# in-guest breaks Azure networking, so we only CHECK it here.
+- name: Verify the lab IP is present on this host
   ansible.windows.win_powershell:
     script: |
       $ErrorActionPreference = 'Stop'
-      $ifn = (Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1).Name
-      # Clear any DHCP lease, pin static
-      Get-NetIPAddress -InterfaceAlias $ifn -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-        Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-      Remove-NetRoute -InterfaceAlias $ifn -Confirm:$false -ErrorAction SilentlyContinue
-      New-NetIPAddress -InterfaceAlias $ifn -IPAddress '{{ dc_ip }}' `
-        -PrefixLength 24 -DefaultGateway '{{ gateway }}'
-      # DC points DNS at itself
-      Set-DnsClientServerAddress -InterfaceAlias $ifn -ServerAddresses '127.0.0.1'
-  register: dc_net
-  changed_when: false
-  failed_when: false   # idempotent re-runs may already have the address
+      $Ansible.Changed = $false
+      if (-not (Get-NetIPAddress -IPAddress '{{ dc_ip }}' -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {
+        throw "No adapter holds {{ dc_ip }}. Check the NIC (Azure) or private_network (Vagrant)."
+      }
+
+- name: Check whether this host is already a domain controller
+  ansible.windows.win_powershell:
+    script: |
+      $Ansible.Changed = $false
+      (Get-CimInstance Win32_ComputerSystem).DomainRole
+  register: domain_controller_role
 
 # ---- 2. Rename + reboot ----------------------------------------------------
 - name: Rename computer to {{ dc_hostname }}
   ansible.windows.win_hostname:
     name: "{{ dc_hostname }}"
-  register: dc_rename
+  register: domain_controller_rename
 
 - name: Reboot after rename
   ansible.windows.win_reboot:
-  when: dc_rename.reboot_required
+  when: domain_controller_rename.reboot_required
 
 # ---- 3. AD DS: promote to a new forest -------------------------------------
+# DomainRole 4/5 = backup/primary DC. Install-ADDSForest refuses to run while
+# the local RID-500 account has a blank password (common on Vagrant boxes).
+# On Azure, RID-500 IS the connection account, so it is left untouched.
+- name: Set a known password on the local RID-500 account (pre-promotion only)
+  ansible.windows.win_powershell:
+    parameters:
+      Password: "{{ builtin_admin_password }}"
+      ConnectUser: "{{ ansible_user }}"
+    script: |
+      param($Password, $ConnectUser)
+      $ErrorActionPreference = 'Stop'
+      $acct = Get-LocalUser | Where-Object { $_.SID.Value -like 'S-1-5-21-*-500' }
+      if ($acct.Name -eq $ConnectUser) { $Ansible.Changed = $false; return }
+      $acct | Set-LocalUser -Password (ConvertTo-SecureString $Password -AsPlainText -Force)
+  when: (domain_controller_role.output[0] | int) < 4
+  no_log: true
+
 - name: Install AD DS role
   ansible.windows.win_feature:
     name: AD-Domain-Services
@@ -43,10 +63,118 @@
 - name: Create the forest / promote to DC
   microsoft.ad.domain:
     dns_domain_name: "{{ domain_name }}"
+    domain_netbios_name: "{{ domain_netbios }}"
     safe_mode_password: "{{ dsrm_password }}"
-    reboot: true          # module waits for the DC to come back up
+    install_dns: true
+    reboot: true          # module reboots and waits for the DC to come back
 
-# ---- 4. AD CS (for later ADCS attacks) -------------------------------------
+- name: Wait for Active Directory Web Services to answer
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $Ansible.Changed = $false
+      Get-ADDomain | Out-Null
+  register: domain_controller_adws
+  until: domain_controller_adws is succeeded
+  retries: 30
+  delay: 20
+
+# ---- 4. DNS ----------------------------------------------------------------
+# Own lab IP rather than 127.0.0.1, so it still resolves when the DNS server
+# is restricted to listening on the lab IP (see the next task).
+- name: Point the DC's DNS client at itself
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $idx = (Get-NetIPAddress -IPAddress '{{ dc_ip }}' -AddressFamily IPv4).InterfaceIndex
+      $cur = (Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4).ServerAddresses -join ','
+      if ($cur -ne '{{ dc_ip }}') {
+        Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses '{{ dc_ip }}'
+      } else { $Ansible.Changed = $false }
+
+# Tailscale (Azure, tailscale mode) makes the DC multi-homed. Its 100.x address
+# must never land in AD DNS, or workstations would try to reach the DC through
+# an address only the tailnet can route. Standard multi-homed-DC hygiene:
+# no registration on that adapter, DNS listens on the lab IP only, and any
+# stray 100.64.0.0/10 records are removed. No-op where there's no Tailscale.
+- name: Keep the tailnet address out of AD DNS
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $changed = $false
+      $ts = @(Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -like 'Tailscale*' -or $_.InterfaceDescription -like 'Tailscale*' })
+      if ($ts.Count -eq 0) { $Ansible.Changed = $false; return }
+
+      foreach ($a in $ts) {
+        if ((Get-DnsClient -InterfaceIndex $a.ifIndex).RegisterThisConnectionsAddress) {
+          Set-DnsClient -InterfaceIndex $a.ifIndex -RegisterThisConnectionsAddress $false
+          $changed = $true
+        }
+      }
+
+      $s = Get-DnsServerSetting -All
+      $listen = @($s.ListeningIPAddress | ForEach-Object { $_.IPAddressToString })
+      if (($listen -join ',') -ne '{{ dc_ip }}') {
+        $s.ListeningIPAddress = @([IPAddress]'{{ dc_ip }}')
+        Set-DnsServerSetting -InputObject $s
+        $changed = $true
+      }
+
+      $tailnet = [IPAddress]'100.64.0.0'; $mask = [IPAddress]'255.192.0.0'
+      foreach ($zone in '{{ domain_name }}', '_msdcs.{{ domain_name }}') {
+        Get-DnsServerResourceRecord -ZoneName $zone -RRType A -ErrorAction SilentlyContinue |
+          Where-Object { ($_.RecordData.IPv4Address.Address -band $mask.Address) -eq $tailnet.Address } |
+          ForEach-Object {
+            Remove-DnsServerResourceRecord -ZoneName $zone -InputObject $_ -Force
+            $changed = $true
+          }
+      }
+      if ($changed) { ipconfig /registerdns | Out-Null; nltest /dsregdns | Out-Null }
+      $Ansible.Changed = $changed
+
+- name: Forward non-lab DNS to the Azure resolver
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $fwd = @((Get-DnsServerForwarder).IPAddress | ForEach-Object { $_.IPAddressToString })
+      if ($fwd -notcontains '{{ azure_dns_forwarder }}') {
+        Add-DnsServerForwarder -IPAddress '{{ azure_dns_forwarder }}'
+      } else { $Ansible.Changed = $false }
+  when: lab_platform | default('vagrant') == 'azure'
+
+# ---- 5. Users + groups -----------------------------------------------------
+- name: Create domain users (+ SPN on the Kerberoastable service account)
+  microsoft.ad.user:
+    identity: "{{ item.sam }}"
+    name: "{{ item.first }} {{ item.last }}"
+    display_name: "{{ item.first }} {{ item.last }}"
+    sam_account_name: "{{ item.sam }}"
+    upn: "{{ item.sam }}@{{ domain_name }}"
+    firstname: "{{ item.first }}"
+    surname: "{{ item.last }}"
+    password: "{{ item.password }}"
+    update_password: when_changed
+    password_never_expires: true
+    enabled: true
+    description: "{{ item.description | default(omit) }}"
+    spn: "{{ {'add': [spn.value]} if item.sam == spn.account else omit }}"
+    state: present
+  loop: "{{ domain_users }}"
+  loop_control:
+    label: "{{ item.sam }}"
+
+- name: Grant domain-admin users the full Administrator group set
+  microsoft.ad.group:
+    identity: "{{ item }}"
+    members:
+      add: "{{ domain_users | selectattr('domain_admin') | map(attribute='sam') | list }}"
+    state: present
+  loop: "{{ domain_admin_groups }}"
+
+# ---- 6. AD CS (Enterprise Root CA) -----------------------------------------
+# An Enterprise CA needs Enterprise Admin and an interactive token, so this runs
+# via `become` as the lab admin (tstark) — known password on every platform.
 - name: Install AD CS role
   ansible.windows.win_feature:
     name: ADCS-Cert-Authority
@@ -57,41 +185,19 @@
   ansible.windows.win_powershell:
     script: |
       $ErrorActionPreference = 'Stop'
-      try {
-        Install-AdcsCertificationAuthority -CAType EnterpriseRootCa -Force
-      } catch {
-        if ($_ -notmatch 'already installed') { throw }
+      if (Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration' -ErrorAction SilentlyContinue) {
+        $Ansible.Changed = $false
+        return
       }
-  changed_when: false
-  failed_when: false
-
-# ---- 5. Users --------------------------------------------------------------
-- name: Create domain users
-  microsoft.ad.user:
-    name: "{{ item.sam }}"
-    firstname: "{{ item.first }}"
-    surname: "{{ item.last }}"
-    password: "{{ item.password }}"
-    password_never_expires: true
-    description: "{{ item.description | default(omit) }}"
-    state: present
-  loop: "{{ domain_users }}"
-  loop_control:
-    label: "{{ item.sam }}"
-
-- name: Add Domain Admins membership
-  microsoft.ad.group:
-    name: Domain Admins
-    members:
-      add: "{{ domain_users | selectattr('domain_admin') | map(attribute='sam') | list }}"
-    state: present
-
-# ---- 6. Kerberoasting SPN --------------------------------------------------
-- name: Register SPN on the service account
-  ansible.windows.win_shell: "setspn -s {{ spn.value }} {{ domain_netbios }}\\{{ spn.account }}"
-  register: spn_out
-  changed_when: "'Updated object' in spn_out.stdout"
-  failed_when: spn_out.rc != 0 and 'Duplicate SPN' not in spn_out.stdout
+      Install-AdcsCertificationAuthority -CAType EnterpriseRootCa `
+        -CACommonName '{{ domain_netbios }}-{{ dc_hostname }}-CA' `
+        -KeyLength 2048 -HashAlgorithmName SHA256 `
+        -ValidityPeriod Years -ValidityPeriodUnits 5 -Force | Out-Null
+  become: true
+  become_method: ansible.builtin.runas
+  become_user: "{{ lab_admin_user }}"
+  vars:
+    ansible_become_password: "{{ lab_admin_password }}"
 
 # ---- 7. SMB share ----------------------------------------------------------
 - name: Create share directory
@@ -110,20 +216,33 @@
   ansible.windows.win_powershell:
     script: |
       $ErrorActionPreference = 'Stop'
+      $changed = $false
       $gpoName = 'Disable Windows Defender'
       if (-not (Get-GPO -Name $gpoName -ErrorAction SilentlyContinue)) {
-          New-GPO -Name $gpoName | New-GPLink -Target (Get-ADDomain).DistinguishedName
+        New-GPO -Name $gpoName | Out-Null; $changed = $true
+      }
+      $dn = (Get-ADDomain).DistinguishedName
+      if (-not ((Get-GPInheritance -Target $dn).GpoLinks | Where-Object DisplayName -eq $gpoName)) {
+        New-GPLink -Name $gpoName -Target $dn | Out-Null; $changed = $true
       }
       $key = 'HKLM\Software\Policies\Microsoft\Windows Defender'
-      Set-GPRegistryValue -Name $gpoName -Key $key -ValueName 'DisableAntiSpyware' -Type DWord -Value 1
-      Set-GPRegistryValue -Name $gpoName -Key "$key\Real-Time Protection" `
-        -ValueName 'DisableRealtimeMonitoring' -Type DWord -Value 1
+      $values = @(
+        @{ Key = $key;                          Name = 'DisableAntiSpyware' },
+        @{ Key = "$key\Real-Time Protection";   Name = 'DisableRealtimeMonitoring' }
+      )
+      foreach ($v in $values) {
+        $cur = Get-GPRegistryValue -Name $gpoName -Key $v.Key -ValueName $v.Name -ErrorAction SilentlyContinue
+        if (-not $cur -or $cur.Value -ne 1) {
+          Set-GPRegistryValue -Name $gpoName -Key $v.Key -ValueName $v.Name -Type DWord -Value 1 | Out-Null
+          $changed = $true
+        }
+      }
+      $Ansible.Changed = $changed
   when: disable_defender | bool
-  changed_when: false
 
-- name: "LAB NOTE — attack surface summary"
+- name: "LAB NOTE — DC summary"
   ansible.builtin.debug:
     msg: >
       HYDRA-DC ready at {{ dc_ip }} for domain {{ domain_name }}.
       Users: {{ domain_users | map(attribute='sam') | join(', ') }}.
-      SPN {{ spn.value }} registered. Share \\{{ dc_hostname }}\{{ smb_share.name }} created.
+      SPN {{ spn.value }} on {{ spn.account }}. Share \\{{ dc_hostname }}\{{ smb_share.name }} created.

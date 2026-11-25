@@ -1,49 +1,52 @@
 ---
 # =============================================================================
 #  Role: domain_member
-#  Configures a Windows 10 workstation: static IP, DNS at the DC, domain join,
-#  local-admin seeding, and the lab weakenings (firewall + Defender off).
+#  Configures a workstation: DNS at the DC, rename, domain join (as the lab
+#  admin from group_vars), local-admin seeding, and the lab weakenings.
+#  Every task is idempotent.
 # =============================================================================
 
-# ---- 1. Networking (DNS must point at the DC before the join) --------------
-- name: Set static IPv4 + DNS pointing at the DC
+# ---- 1. DNS (must point at the DC before the join) -------------------------
+# The IP itself is never rewritten in-guest (Azure DHCP reservation / Vagrant
+# private_network own it); we find the lab adapter by its IP and set DNS there.
+- name: Point the lab adapter's DNS at the DC
   ansible.windows.win_powershell:
     script: |
       $ErrorActionPreference = 'Stop'
-      $ifn = (Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1).Name
-      Get-NetIPAddress -InterfaceAlias $ifn -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-        Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-      Remove-NetRoute -InterfaceAlias $ifn -Confirm:$false -ErrorAction SilentlyContinue
-      New-NetIPAddress -InterfaceAlias $ifn -IPAddress '{{ ws_ip }}' `
-        -PrefixLength 24 -DefaultGateway '{{ gateway }}'
-      Set-DnsClientServerAddress -InterfaceAlias $ifn -ServerAddresses '{{ dc_ip }}'
-  changed_when: false
-  failed_when: false
+      $ip = Get-NetIPAddress -IPAddress '{{ ws_ip }}' -AddressFamily IPv4 -ErrorAction SilentlyContinue
+      if (-not $ip) { throw "No adapter holds {{ ws_ip }}. Check the NIC (Azure) or private_network (Vagrant)." }
+      $cur = (Get-DnsClientServerAddress -InterfaceIndex $ip.InterfaceIndex -AddressFamily IPv4).ServerAddresses -join ','
+      if ($cur -ne '{{ dc_ip }}') {
+        Set-DnsClientServerAddress -InterfaceIndex $ip.InterfaceIndex -ServerAddresses '{{ dc_ip }}'
+        Clear-DnsClientCache
+      } else { $Ansible.Changed = $false }
 
-- name: Wait for the DC's DNS to resolve the domain
+- name: Wait until the DC advertises the domain (LDAP SRV record)
   ansible.windows.win_powershell:
-    script: "Resolve-DnsName {{ domain_name }} -Server {{ dc_ip }} | Out-Null"
-  register: dns_ok
-  retries: 10
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $Ansible.Changed = $false
+      Resolve-DnsName -Name '_ldap._tcp.dc._msdcs.{{ domain_name }}' -Type SRV -Server '{{ dc_ip }}' -DnsOnly | Out-Null
+  register: domain_member_dns
+  until: domain_member_dns is succeeded
+  retries: 20
   delay: 15
-  until: dns_ok.error is not defined
-  changed_when: false
 
 # ---- 2. Rename + domain join ----------------------------------------------
 - name: Set hostname
   ansible.windows.win_hostname:
     name: "{{ ws_name }}"
-  register: ws_rename
+  register: domain_member_rename
 
 - name: Reboot after rename
   ansible.windows.win_reboot:
-  when: ws_rename.reboot_required
+  when: domain_member_rename.reboot_required
 
-- name: Join {{ domain_name }}
+- name: Join the domain as {{ lab_admin_user }}
   microsoft.ad.membership:
     dns_domain_name: "{{ domain_name }}"
-    domain_admin_user: "{{ domain_netbios }}\\Administrator"
-    domain_admin_password: "{{ domain_admin_password }}"
+    domain_admin_user: "{{ lab_admin_user }}"
+    domain_admin_password: "{{ lab_admin_password }}"
     state: domain
     reboot: true
 
@@ -57,18 +60,38 @@
 # ---- 4. Lab weakenings -----------------------------------------------------
 - name: Disable Windows Firewall (opens SMB for relay/psexec)
   ansible.windows.win_powershell:
-    script: "Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False"
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $on = Get-NetFirewallProfile | Where-Object Enabled
+      if ($on) { $on | Set-NetFirewallProfile -Enabled False } else { $Ansible.Changed = $false }
   when: disable_firewall | bool
-  changed_when: false
+
+- name: Do not require SMB signing (server + client side)
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $changed = $false
+      if ((Get-SmbServerConfiguration).RequireSecuritySignature) {
+        Set-SmbServerConfiguration -RequireSecuritySignature $false -Force; $changed = $true
+      }
+      if ((Get-SmbClientConfiguration).RequireSecuritySignature) {
+        Set-SmbClientConfiguration -RequireSecuritySignature $false -Force; $changed = $true
+      }
+      $Ansible.Changed = $changed
+  when: disable_smb_signing | bool
 
 - name: Disable Defender real-time protection
   ansible.windows.win_powershell:
     script: |
-      Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
-      # gpupdate pulls the DC's Defender GPO as well
+      $Ansible.Changed = $false
+      $mp = Get-MpPreference -ErrorAction SilentlyContinue
+      if ($mp -and -not $mp.DisableRealtimeMonitoring) {
+        # Tamper Protection can silently veto this; the DC's GPO is the backstop.
+        Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+        $Ansible.Changed = $true
+      }
       gpupdate /force | Out-Null
   when: disable_defender | bool
-  changed_when: false
 
 - name: "LAB NOTE — workstation ready"
   ansible.builtin.debug:

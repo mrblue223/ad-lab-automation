@@ -1,18 +1,47 @@
-# Terraform
+# =============================================================================
+#  Nothing user-specific is ever committed. `make setup` writes your values
+#  (IP, VM password, Tailscale key, region) ONLY to paths ignored below, and
+#  refuses to run if any of them would be tracked. Check: make audit
+# =============================================================================
+
+# ---- Runtime configuration + secrets (written by make setup / deploy) ------
+*.tfvars
+*.tfvars.json
+.secrets/
+*authkey*
+*.bak
+*.orig
+.env
+.env.*
+
+# ---- Terraform -------------------------------------------------------------
 .terraform/
 *.tfstate
 *.tfstate.*
-terraform.tfvars
+*.tfplan
 crash.log
-# Vagrant
-.vagrant/
-# Ansible
-*.retry
-ansible/collections/
-# Secrets
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# ---- Generated at deploy time (contain IPs / creds) ------------------------
+ansible/inventory/azure_generated.*
+ATTACK_FROM_KALI.txt
+
+# ---- Keys / credentials ----------------------------------------------------
 *.pem
 *.key
+*.pfx
+*.p12
+id_rsa*
+id_ed25519*
+id_ecdsa*
+*.kdbx
 
-# Auto-generated at deploy time
-ansible/inventory/azure_generated.ini
-ATTACK_FROM_KALI.txt
+# ---- Vagrant / Ansible / Python --------------------------------------------
+.vagrant/
+*.retry
+ansible/collections/
+__pycache__/

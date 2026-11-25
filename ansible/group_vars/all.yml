@@ -32,11 +32,51 @@ gateway: "10.0.2.1"
 # Intentionally weak / misconfigured — this is a deliberately vulnerable lab.
 # Do NOT reuse these anywhere real.
 domain_users:
-  - { first: "Tony",  last: "Stark",   sam: "tstark",      password: "P@$$w0rd",       domain_admin: true  }
-  - { first: "Frank", last: "Castle",  sam: "fcastle",     password: "Password1",      domain_admin: false }
-  - { first: "Peter", last: "Parker",  sam: "pparker",     password: "Password2",      domain_admin: false }
-  - { first: "SQL",   last: "Service", sam: "SQL_Service", password: "MYpassword123#", domain_admin: false,
-      description: "The password is MYpassword123#" }   # planted creds-in-description finding
+  - first: "Tony"
+    last: "Stark"
+    sam: "tstark"
+    password: "P@$$w0rd"
+    domain_admin: true
+  - first: "Frank"
+    last: "Castle"
+    sam: "fcastle"
+    password: "Password1"
+    domain_admin: false
+  - first: "Peter"
+    last: "Parker"
+    sam: "pparker"
+    password: "Password2"
+    domain_admin: false
+  - first: "SQL"
+    last: "Service"
+    sam: "SQL_Service"
+    password: "MYpassword123#"
+    domain_admin: false
+    description: "The password is MYpassword123#"   # planted creds-in-description finding
+
+# Groups every `domain_admin: true` user gets. In the course, tstark is created
+# by copying Administrator, so he carries all of these.
+domain_admin_groups:
+  - "Domain Admins"
+  - "Enterprise Admins"
+  - "Schema Admins"
+  - "Group Policy Creator Owners"
+
+# ---- Privileged credential used by the automation --------------------------
+# The ONE credential used for workstation domain-joins and for DC tasks that
+# need Enterprise Admin (AD CS). It is a domain user defined above, so its
+# password is known on every platform — unlike the built-in Administrator,
+# which on Azure is renamed to the VM admin (e.g. azureadmin) and on Vagrant
+# may have a blank/unknown password.
+lab_admin_account: "tstark"
+lab_admin_user: "{{ domain_netbios }}\\{{ lab_admin_account }}"
+lab_admin_password: "{{ (domain_users | selectattr('sam', 'equalto', lab_admin_account) | first).password }}"
+
+# Password applied to the local RID-500 account BEFORE promotion when it is not
+# the account Ansible connects with (Vagrant boxes). Promotion refuses to run if
+# that account's password is blank; afterwards it is MARVEL\Administrator.
+# On Azure the RID-500 account IS the VM admin, so it is left alone.
+builtin_admin_password: "P@$$w0rd!"
 
 # ---- Kerberoasting target (SPN on the service account) ---------------------
 spn:
@@ -57,7 +97,14 @@ local_admins:
 disable_defender: true      # turn off Defender AV so payloads land
 disable_firewall: true      # open SMB (445) for relay / psexec
 disable_llmnr: false        # keep LLMNR ON so the poisoning attack works
+disable_smb_signing: true   # workstations: signing not required (Win11 24H2+ requires it by default)
+
+# ---- Platform-specific -----------------------------------------------------
+# `lab_platform` (azure | vagrant) is set by the inventory.
+# On Azure the DC forwards non-lab DNS to the Azure resolver so lab hosts can
+# still reach the internet (Windows Update, etc.).
+azure_dns_forwarder: "168.63.129.16"
 
 # ---- WinRM / connection creds (set per-platform at deploy time) ------------
 # Vagrant uses vagrant/vagrant; Azure uses the admin set in terraform.tfvars.
-# These are overridden by the inventory, not hard-coded here.
+# These come from the inventory, not from here.

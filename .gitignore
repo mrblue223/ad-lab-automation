@@ -45,3 +45,11 @@ id_ecdsa*
 *.retry
 ansible/collections/
 __pycache__/
+
+# ---- Attack loot / evidence (NEVER commit — real hashes, krbtgt, DPAPI, etc.) ----
+marvel-loot/
+loot/
+evidence/
+*.ntds
+*.secretsdump
+*hashes.txt

